@@ -3,11 +3,11 @@ import requests
 import csv
 import xml.etree.ElementTree as ET
 import tkinter as tk
-from tkinter import messagebox, ttk, filedialog, simpledialog
+from tkinter import messagebox, ttk, filedialog
 from dotenv import load_dotenv
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import glob
 
 load_dotenv()
@@ -15,277 +15,232 @@ load_dotenv()
 class VividMasterApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Vivid Seats Pro: Master Fulfillment Suite v12.0")
-        self.root.geometry("1150x950")
+        self.root.title("Vivid Seats Pro: Master Manager (Dual-Fetch & URL Transfer)")
+        self.root.geometry("1300x950")
         
         self.api_token = os.getenv("VIVID_API_TOKEN", "")
         self.enriched_data = {} 
         self.phase1_results = [] 
         self.current_filename = ""
-        self.selected_order_id = None
-        self.url_entries = []
+        self.sort_reverse = False
 
         self.setup_ui()
         self.auto_load_existing_csvs()
 
     def setup_ui(self):
-        # --- TOP CONTROL PANEL ---
-        self.ctrl_frame = tk.Frame(self.root, pady=10)
+        self.paned_window = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
+        self.paned_window.pack(fill="both", expand=True)
+
+        self.left_frame = tk.Frame(self.paned_window)
+        self.right_frame = tk.Frame(self.paned_window, width=380, bg="#f4f7f6", padx=15, pady=15)
+        self.paned_window.add(self.left_frame)
+        self.paned_window.add(self.right_frame)
+
+        self.notebook = ttk.Notebook(self.left_frame)
+        self.notebook.pack(fill="both", expand=True)
+
+        self.main_tab = tk.Frame(self.notebook)
+        self.log_tab = tk.Frame(self.notebook)
+        self.notebook.add(self.main_tab, text="Order Management")
+        self.notebook.add(self.log_tab, text="Activity Log")
+
+        self.ctrl_frame = tk.Frame(self.main_tab, pady=10)
         self.ctrl_frame.pack(fill="x", padx=10)
 
-        self.btn_fetch = tk.Button(self.ctrl_frame, text="FETCH DUAL-STATUS & AUTO-SAVE", command=self.start_dual_fetch, 
-                                   bg="#27ae60", fg="white", font=("Arial", 9, "bold"))
-        self.btn_fetch.pack(side="left", padx=10)
+        self.btn_fetch = tk.Button(self.ctrl_frame, text="RUN DUAL FETCH (Shipment -> Retransfer)", 
+                                   command=self.start_dual_fetch, bg="#27ae60", fg="white", font=("Arial", 9, "bold"))
+        self.btn_fetch.pack(side="left", padx=5)
+
+        self.hide_past_var = tk.BooleanVar(value=True)
+        self.hide_past_check = tk.Checkbutton(self.ctrl_frame, text="Hide Past (-12h)", variable=self.hide_past_var, command=self.refresh_table_view)
+        self.hide_past_check.pack(side="left", padx=10)
 
         self.info_label = tk.Label(self.ctrl_frame, text="Ready", fg="blue")
         self.info_label.pack(side="right", padx=10)
 
-        # --- SEARCH & FILTER BAR ---
-        self.filter_frame = tk.Frame(self.root, pady=5)
-        self.filter_frame.pack(fill="x", padx=10)
-
-        tk.Label(self.filter_frame, text="Search Order ID:").pack(side="left")
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *args: self.refresh_table())
-        self.ent_search = tk.Entry(self.filter_frame, textvariable=self.search_var, width=20)
-        self.ent_search.pack(side="left", padx=5)
-
-        self.today_filter_var = tk.BooleanVar(value=False)
-        self.chk_today = tk.Checkbutton(self.filter_frame, text="Today's Events Only", 
-                                        variable=self.today_filter_var, command=self.refresh_table)
-        self.chk_today.pack(side="left", padx=10)
-
-        self.hide_past_var = tk.BooleanVar(value=True) 
-        self.chk_past = tk.Checkbutton(self.filter_frame, text="Hide Past Events", 
-                                       variable=self.hide_past_var, command=self.refresh_table)
-        self.chk_past.pack(side="left", padx=10)
-
-        # --- PANEL 1: MAIN TABLE ---
-        tk.Label(self.root, text="Panel 1: Order History (Retransfers in Yellow)", font=("Arial", 10, "bold")).pack(anchor="w", padx=10)
-        self.tree1 = ttk.Treeview(self.root, columns=("id", "event", "date", "qty", "status", "transferable"), show="headings", height=10)
-        for col, head in zip(self.tree1["columns"], ["Order ID", "Event", "Event Date", "Qty", "Status", "URL Transfer?"]):
-            self.tree1.heading(col, text=head)
-            self.tree1.column(col, width=150)
-        
-        self.tree1.tag_configure('retransfer', background='#ffffcc') 
+        self.tree1 = ttk.Treeview(self.main_tab, columns=("id", "event", "date", "qty", "status", "transferable"), show="headings", height=15)
+        headers = ["Order ID", "Event", "Event Date", "Qty", "Status", "URL Transfer?"]
+        for col, head in zip(self.tree1["columns"], headers):
+            self.tree1.heading(col, text=head, command=lambda c=col: self.sort_column(c))
+            self.tree1.column(col, width=130)
         self.tree1.pack(fill="both", expand=True, padx=10, pady=5)
         self.tree1.bind("<<TreeviewSelect>>", self.on_order_selected)
 
-        # --- PANEL 2: DETAIL VIEW ---
-        tk.Label(self.root, text="Panel 2: Detailed Data (Double-Click to Copy | Hiding Blanks/False)", font=("Arial", 10, "bold")).pack(anchor="w", padx=10)
-        self.tree2 = ttk.Treeview(self.root, columns=("field", "value"), show="headings", height=8)
-        self.tree2.heading("field", text="Field Name")
-        self.tree2.heading("value", text="Value (Double-Click to Copy)")
-        self.tree2.column("field", width=200)
-        self.tree2.column("value", width=750)
-        
-        self.tree2.tag_configure('email', background='#e1f5fe') # Soft blue for emails
-        
+        self.tree2 = ttk.Treeview(self.main_tab, columns=("field", "value"), show="headings", height=10)
+        self.tree2.heading("field", text="Field Name"); self.tree2.heading("value", text="Value")
+        self.tree2.column("field", width=150); self.tree2.column("value", width=500)
         self.tree2.pack(fill="both", expand=True, padx=10, pady=5)
-        self.tree2.bind("<Double-1>", self.copy_to_clipboard) # Enable copy on double click
 
-        # --- PANEL 3: TRANSFER CONSOLE ---
-        self.transfer_frame = tk.LabelFrame(self.root, text="Panel 3: Phase 3 - URL Transfer Console", 
-                                            font=("Arial", 10, "bold"), fg="#e67e22", pady=10, padx=10)
-        self.transfer_frame.pack(fill="x", padx=10, pady=10)
+        self.history_text = tk.Text(self.log_tab, bg="#1e1e1e", fg="#00ff00", font=("Consolas", 10))
+        self.history_text.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.header_row = tk.Frame(self.transfer_frame)
-        self.header_row.pack(fill="x")
-        tk.Label(self.header_row, text="Selected Order ID:").pack(side="left")
-        self.lbl_transfer_id = tk.Label(self.header_row, text="None", font=("Arial", 9, "bold"))
-        self.lbl_transfer_id.pack(side="left", padx=5)
-
-        self.btn_add_url = tk.Button(self.header_row, text="+ Add Link", command=self.add_url_field, bg="#34495e", fg="white", font=("Arial", 8))
-        self.btn_add_url.pack(side="right", padx=5)
-
-        self.url_container = tk.Frame(self.transfer_frame)
-        self.url_container.pack(fill="x", pady=5)
-
-        self.action_row = tk.Frame(self.transfer_frame)
-        self.action_row.pack(fill="x")
-        self.btn_post_transfer = tk.Button(self.action_row, text="POST ALL LINKS TO VIVID", 
-                                          command=self.execute_url_transfer, bg="#e67e22", fg="white", 
-                                          font=("Arial", 9, "bold"), state="disabled", pady=5)
-        self.btn_post_transfer.pack(side="left", pady=5)
-        self.lbl_transfer_status = tk.Label(self.action_row, text="Status: Waiting...", fg="gray")
-        self.lbl_transfer_status.pack(side="left", padx=20)
-
-        self.add_url_field()
-
-    def copy_to_clipboard(self, event):
-        """Copies the double-clicked value from Panel 2 to system clipboard."""
-        item = self.tree2.identify_row(event.y)
-        column = self.tree2.identify_column(event.x)
-        if item:
-            # We want the value (column 2), index 1 in the list
-            val = self.tree2.item(item)['values'][1]
-            self.root.clipboard_clear()
-            self.root.clipboard_append(val)
-            self.lbl_transfer_status.config(text=f"Copied to clipboard: {val[:30]}...", fg="#2c3e50")
-
-    def on_order_selected(self, event):
-        selected = self.tree1.selection()
-        if not selected: return
-        vals = self.tree1.item(selected[0])['values']
-        self.selected_order_id = str(vals[0])
-        self.lbl_transfer_id.config(text=self.selected_order_id)
-        self.reset_url_fields()
+        # --- RIGHT SIDE: PHASE 3 TRANSFER PANEL ---
+        tk.Label(self.right_frame, text="PHASE 3: URL TRANSFER", font=("Arial", 12, "bold"), bg="#f4f7f6").pack(pady=(0, 20))
         
-        if vals[5] == "YES (URL)":
-            self.btn_post_transfer.config(state="normal")
-            self.btn_add_url.config(state="normal")
-        else:
-            self.btn_post_transfer.config(state="disabled")
-            self.btn_add_url.config(state="disabled")
+        tk.Label(self.right_frame, text="Target Order ID:", bg="#f4f7f6", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.trans_oid_var = tk.StringVar(value="None Selected")
+        tk.Label(self.right_frame, textvariable=self.trans_oid_var, fg="#2c3e50", font=("Arial", 11), bg="#f4f7f6").pack(anchor="w", pady=(0, 15))
 
-        # Refresh Panel 2 with "Hide Blank/False" logic
-        for item in self.tree2.get_children(): self.tree2.delete(item)
-        details = self.enriched_data.get(self.selected_order_id) or next((i for i in self.phase1_results if str(i["orderId"]) == self.selected_order_id), None)
+        tk.Label(self.right_frame, text="Transfer URLs (One per line):", bg="#f4f7f6", font=("Arial", 9, "bold")).pack(anchor="w")
+        self.url_box = tk.Text(self.right_frame, height=12, width=45, font=("Arial", 10))
+        self.url_box.pack(pady=5, fill="x")
+
+        self.btn_submit_transfer = tk.Button(
+            self.right_frame, text="EXECUTE TRANSFER POST", command=self.execute_integrated_transfer, 
+            bg="#bdc3c7", fg="white", font=("Arial", 10, "bold"), pady=15, state="disabled"
+        )
+        self.btn_submit_transfer.pack(fill="x", pady=20)
         
-        if details:
-            for k, v in sorted(details.items()):
-                # Logic to hide blank/false/null fields
-                val_str = str(v).lower().strip()
-                if not v or val_str == "" or val_str == "false" or val_str == "none":
-                    continue
-                
-                tag = 'email' if k == 'emailAddress' else ''
-                self.tree2.insert("", "end", values=(k, v), tags=(tag,))
+        self.write_log("Application Initialized. Use DUAL FETCH to begin.")
 
-    def refresh_table(self):
-        for item in self.tree1.get_children():
-            self.tree1.delete(item)
-
-        search_query = self.search_var.get().strip().lower()
-        filter_today = self.today_filter_var.get()
-        filter_past = self.hide_past_var.get()
-        today_date = datetime.now().date()
-        today_str = today_date.strftime("%Y-%m-%d")
-
-        for data in self.phase1_results:
-            order_id = str(data.get("orderId", "")).lower()
-            event_date_full = data.get("eventDate", "")
-            event_date_only_str = event_date_full.split(" ")[0] if event_date_full else ""
-            
-            try:
-                event_date_obj = datetime.strptime(event_date_only_str, "%Y-%m-%d").date()
-            except:
-                event_date_obj = None
-
-            matches_search = search_query in order_id
-            is_today = event_date_only_str == today_str
-            is_past = event_date_obj < today_date if event_date_obj else False
-
-            if matches_search:
-                if filter_today and not is_today: continue
-                if filter_past and is_past: continue
-                self.add_to_tree1(data)
+    def write_log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.history_text.insert(tk.END, f"[{ts}] {msg}\n"); self.history_text.see(tk.END)
 
     def start_dual_fetch(self):
         if not self.api_token:
             messagebox.showerror("Error", ".env missing VIVID_API_TOKEN")
             return
         self.btn_fetch.config(state="disabled")
-        threading.Thread(target=self.dual_fetch_process, daemon=True).start()
+        threading.Thread(target=self.run_dual_sequence, daemon=True).start()
 
-    def dual_fetch_process(self):
-        all_new_data = []
-        self.root.after(0, lambda: self.info_label.config(text="Pulling Shipments...", fg="orange"))
-        all_new_data.extend(self.fetch_helper(self.api_token, "PENDING_SHIPMENT"))
-        all_new_data.extend(self.fetch_helper(self.api_token, "PENDING_RETRANSFER"))
-
-        if all_new_data:
-            self.auto_save_session(all_new_data)
-            self.root.after(0, lambda: self.info_label.config(text=f"Fetched Total: {len(all_new_data)}", fg="blue"))
-            threading.Thread(target=self.background_enrichment, args=(self.api_token, all_new_data), daemon=True).start()
+    def run_dual_sequence(self):
+        combined_new_orders = []
+        self.info_label.config(text="Fetching Shipment...", fg="orange")
+        combined_new_orders.extend(self.fetch_api_logic("https://brokers.vividseats.com/webservices/v1/getOrders", {"apiToken": self.api_token, "status": "PENDING_SHIPMENT"}))
         
-        time.sleep(5) 
+        self.info_label.config(text="Fetching Retransfer...", fg="orange")
+        combined_new_orders.extend(self.fetch_api_logic("https://brokers.vividseats.com/webservices/v1/getPendingRetransferOrders", {"apiToken": self.api_token}))
+
+        final_session_list = []
+        for data in combined_new_orders:
+            oid = data.get("orderId")
+            if not any(d.get('orderId') == oid for d in self.phase1_results):
+                self.phase1_results.append(data)
+                final_session_list.append(data)
+        
+        self.auto_save_session(final_session_list)
+        self.root.after(0, self.refresh_table_view)
+        self.info_label.config(text="Enriching Data...", fg="blue")
+        self.background_enrichment(self.api_token, final_session_list)
+        
+        time.sleep(5)
         self.root.after(0, lambda: self.btn_fetch.config(state="normal"))
 
-    def fetch_helper(self, token, status):
-        is_retransfer = status == "PENDING_RETRANSFER"
-        url = "https://brokers.vividseats.com/webservices/v1/getPendingRetransferOrders" if is_retransfer else "https://brokers.vividseats.com/webservices/v1/getOrders"
-        params = {"apiToken": token} if is_retransfer else {"apiToken": token, "status": status}
+    def fetch_api_logic(self, url, params):
         try:
             res = requests.get(url, params=params, headers={"Accept": "application/xml"}, timeout=30)
             if res.status_code == 200:
                 root = ET.fromstring(res.content)
-                orders = root.findall("order")
-                parsed = []
-                for o in orders:
-                    data = {child.tag: (child.text.strip() if child.text else "") for child in o}
-                    if is_retransfer: data['status'] = "PENDING_RETRANSFER"
-                    if not any(d.get('orderId') == data.get("orderId") for d in self.phase1_results):
-                        self.phase1_results.append(data)
-                        self.root.after(0, self.refresh_table) 
-                    parsed.append(data)
-                return parsed
-        except: return []
+                return [{child.tag: (child.text.strip() if child.text else "") for child in o} for o in root.findall("order")]
+        except Exception as e: self.write_log(f"Fetch Error: {e}")
+        return []
 
     def background_enrichment(self, token, session_data):
-        for i, order in enumerate(session_data):
+        for order in session_data:
             oid = order.get("orderId")
-            url = "https://brokers.vividseats.com/webservices/v1/getOrder"
             try:
-                res = requests.get(url, params={"apiToken": token, "orderId": oid}, headers={"Accept": "application/xml"}, timeout=15)
+                res = requests.get("https://brokers.vividseats.com/webservices/v1/getOrder", params={"apiToken": token, "orderId": oid}, headers={"Accept": "application/xml"}, timeout=15)
                 if res.status_code == 200:
-                    root = ET.fromstring(res.content)
-                    details = {child.tag: (child.text.strip() if child.text else "") for child in root}
+                    details = {child.tag: (child.text.strip() if child.text else "") for child in ET.fromstring(res.content)}
                     self.enriched_data[oid] = details
-                    self.root.after(0, self.refresh_table) 
+                    self.root.after(0, self.update_tree1_row, oid, details)
             except: pass
+        self.root.after(0, lambda: self.info_label.config(text="Sync Complete", fg="green"))
 
-    def add_url_field(self):
-        frame = tk.Frame(self.url_container)
-        frame.pack(fill="x", pady=2)
-        ent = tk.Entry(frame, width=100)
-        ent.pack(side="left", padx=5, fill="x", expand=True)
-        self.url_entries.append({'frame': frame, 'entry': ent})
-
-    def reset_url_fields(self):
-        for item in self.url_entries: item['frame'].destroy()
-        self.url_entries = []
-        self.add_url_field()
-
-    def execute_url_transfer(self):
-        order_id = self.selected_order_id
+    # --- PHASE 3 EXECUTION ---
+    def execute_integrated_transfer(self):
+        order_id = self.trans_oid_var.get()
         details = self.enriched_data.get(order_id)
-        final_urls = [item['entry'].get().strip() for item in self.url_entries if item['entry'].get().strip()]
-        if not final_urls: return
-        payload = {"apiToken": self.api_token, "orderId": order_id, "orderToken": details.get('orderToken', ''),
-                   "transferURLList": final_urls, "transferSource": "Vivid_v12", "transferSourceURL": final_urls[0]}
+        raw_text = self.url_box.get("1.0", tk.END).strip()
+        url_list = [line.strip() for line in raw_text.splitlines() if line.strip()]
+        
+        if not url_list or not details: return
+
+        # Construct payload matching url-encoded requirements
+        payload = {
+            "apiToken": self.api_token,
+            "orderId": order_id,
+            "orderToken": details.get('orderToken', ''),
+            "transferURLList": url_list,
+            "transferSource": "Manual_GUI_Automation",
+            "transferSourceURL": url_list[0]
+        }
+
         try:
-            res = requests.post("https://brokers.vividseats.com/webservices/v1/transferOrderViaURL", data=payload, headers={"Accept": "application/xml"})
-            if res.status_code == 200:
-                root = ET.fromstring(res.content)
-                self.lbl_transfer_status.config(text=f"SUCCESS: {root.findtext('message')}", fg="green")
-                self.reset_url_fields()
-        except: pass
+            res = requests.post(
+                "https://brokers.vividseats.com/webservices/v1/transferOrderViaURL", 
+                data=payload, 
+                headers={"Accept": "application/xml", "Content-Type": "application/x-www-form-urlencoded"}
+            )
+            root = ET.fromstring(res.content)
+            success = root.findtext('success')
+            msg = root.findtext('message') or "No response message"
+            
+            self.write_log(f"TRANSFER [{order_id}]: Success={success} | {msg}")
+            messagebox.showinfo("Result", f"Transfer Success: {success}\n{msg}")
+            if success == 'true': self.url_box.delete("1.0", tk.END)
+        except Exception as e: self.write_log(f"POST Error: {e}")
 
-    def add_to_tree1(self, data):
-        details = self.enriched_data.get(data.get("orderId"), data)
-        is_url = "YES (URL)" if details.get('transferViaURL') == 'true' else "Scanning..."
-        tag = 'retransfer' if data.get("status") == "PENDING_RETRANSFER" else ''
-        self.tree1.insert("", "end", values=(data.get("orderId"), data.get("event"), data.get("eventDate"), data.get("quantity"), data.get("status"), is_url), tags=(tag,))
+    def on_order_selected(self, event):
+        selected = self.tree1.selection()
+        if not selected: return
+        vals = self.tree1.item(selected[0])['values']
+        oid = str(vals[0])
+        self.trans_oid_var.set(oid)
+        
+        # Phase 3 Activation Check
+        if vals[5] == "YES (URL)":
+            self.btn_submit_transfer.config(state="normal", bg="#e67e22")
+        else:
+            self.btn_submit_transfer.config(state="disabled", bg="#bdc3c7")
 
-    def auto_save_session(self, data_list):
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        with open(f"VividOrders_{ts}.csv", "w", newline="", encoding="utf-8") as f:
-            headers = set().union(*(d.keys() for d in data_list))
-            writer = csv.DictWriter(f, fieldnames=sorted(list(headers)))
-            writer.writeheader()
-            writer.writerows(data_list)
+        for item in self.tree2.get_children(): self.tree2.delete(item)
+        details = self.enriched_data.get(oid) or next((i for i in self.phase1_results if str(i["orderId"]) == oid), None)
+        if details:
+            for k, v in sorted(details.items()): self.tree2.insert("", "end", values=(k, v))
+
+    def refresh_table_view(self):
+        for item in self.tree1.get_children(): self.tree1.delete(item)
+        threshold = datetime.now() - timedelta(hours=12)
+        for data in self.phase1_results:
+            if self.hide_past_var.get():
+                try:
+                    if datetime.strptime(data.get("eventDate"), "%Y-%m-%d %H:%M:%S") < threshold: continue
+                except: pass
+            oid = data.get("orderId")
+            is_url = "YES (URL)" if self.enriched_data.get(oid, {}).get('transferViaURL') == 'true' or data.get('transferViaURL') == 'true' else "No"
+            self.tree1.insert("", "end", values=(oid, data.get("event"), data.get("eventDate"), data.get("quantity"), data.get("status"), is_url))
+        self.auto_sort_by_date()
+
+    def sort_column(self, col):
+        l = [(self.tree1.set(k, col), k) for k in self.tree1.get_children('')]
+        l.sort(reverse=self.sort_reverse); self.sort_reverse = not self.sort_reverse
+        for index, (val, k) in enumerate(l): self.tree1.move(k, '', index)
+
+    def auto_sort_by_date(self):
+        items = [(self.tree1.set(k, "date"), k) for k in self.tree1.get_children('')]
+        items.sort(key=lambda x: datetime.strptime(x[0], "%Y-%m-%d %H:%M:%S") if x[0] else datetime.max)
+        for index, (val, k) in enumerate(items): self.tree1.move(k, '', index)
 
     def auto_load_existing_csvs(self):
         for file in glob.glob("*.csv"):
             try:
                 with open(file, mode='r', encoding='utf-8') as f:
                     for row in csv.DictReader(f):
-                        if row.get('orderId') and not any(d.get('orderId') == row['orderId'] for d in self.phase1_results):
+                        if row.get('orderId') and not any(d.get('orderId') == row.get('orderId') for d in self.phase1_results):
                             self.phase1_results.append(row)
                             if len(row) > 10: self.enriched_data[row['orderId']] = row
             except: pass
-        self.refresh_table()
+        self.refresh_table_view()
+
+    def auto_save_session(self, data_list):
+        if not data_list: return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        headers = sorted(list(set().union(*(d.keys() for d in data_list))))
+        with open(f"Vivid_Batch_{ts}.csv", "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers)
+            writer.writeheader(); writer.writerows(data_list)
 
 if __name__ == "__main__":
     main_root = tk.Tk()
